@@ -1,5 +1,7 @@
 This repo contains files for parsing C programs and attmepting to move indirect control flow stuctures to direct control flow. 
 
+To demonstrate the effectiveness of this technique we have included the inih library, which we have determined is effective at 
+demonstrating some of of the control flow patterns that we are interested in correcting.
 
 The "inih" library is distributed under the New BSD license:
 
