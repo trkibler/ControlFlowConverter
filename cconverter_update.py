@@ -1,6 +1,7 @@
 from pycparser import c_parser, c_ast, c_generator
 import hashlib
 import re
+import sys
 
 class cConverter:
     def __init__(self):
@@ -120,11 +121,38 @@ class cConverter:
         processed_code = '\n'.join(lines)
         processed_code = re.sub(r"printf\('(.*?)'\)", r'printf("\1")', processed_code)
         return processed_code
+    
+    def _remove_comments(self, c_code):
+        working = True
+        ret_code = ""
+        while working:
+            if c_code.find("""'"'""") >= 0:
+                 start = c_code.find("""'"'""")
+                 end = start+3
+                 ret_code += c_code[:end]
+                 c_code = c_code[end:]
+            elif c_code.find("/*") >= 0 and (c_code.find('"') == -1 or c_code.find("/*") < c_code.find('"')):
+                start = c_code.find('/*')
+                end = len(c_code[:start+1]) + c_code[start+1:].find('*/') 
+                c_code = c_code[:start] + c_code[end+2:]
+            elif c_code.find("//") >= 0 and (c_code.find('"') == -1 or c_code.find("//") < c_code.find('"')):
+                start = c_code.find("//")
+                end = len(c_code[:start]) + c_code[start:].find("\n") 
+                c_code = c_code[:start] + c_code[end:]
+            elif (c_code.find('"') >= 0):
+                start = c_code.find('"')
+                end = len(c_code[:start+1]) + c_code[start+1:].find('"') 
+                ret_code += c_code[:end+1]
+                c_code = c_code[end+1:]
+            else:
+                working = False
+        return ret_code + c_code
 
     def convert(self, c_code):
         """Convert C code to remove function pointers and use direct calls"""
         try:
             code_hash = hashlib.md5(c_code.encode()).digest()
+            c_code = self._remove_comments(c_code)
             if code_hash in self.ast_cache:
                 ast = self.ast_cache[code_hash]
             else:
@@ -237,51 +265,64 @@ class ReturnConverter:
 
         return self.generator.visit(ast)
 
+
+
+if __name__ == '__main__':  
+
+    if(len(sys.argv) > 1):
+        try:
+            c_code = ""
+            with open(sys.argv[1], "r") as cfile:
+                c_code = '\n'.join(cfile.readlines())
+            print(ReturnConverter().transform(cConverter().convert(c_code)))
+        except Exception as e:
+            print(e)
         
-
-# Test code
-if __name__ == "__main__":
-    c_code2 = """
-    void foo() {printf('foo');}
-    void bar() {printf('bar');}
-    int main() {
-        void (*fp)();
-        int input = 0;
-        if (input == 0)
-            fp = foo;
-        else
-            fp = bar;
-        fp();
-        return 0;
-    }
-    """
-    c_code = """
-    void hello() { printf("Hello\\n"); }
-    void goodbye() { printf("Goodbye\\n"); }
-    void nested() { printf("Nested\\n"); }
-    int main() {
-        void (*fp)();
-        void (*fp2)();
-        int i = 0;
-        fp = hello;
-        for(i = 0; i < 2; i++) {
-            while(i < 1) {
-                fp();
-                fp = goodbye;
-            }
-            do {
-                fp2 = nested;
-                fp2();
-            } while(i < 1);
+    else:
+        print("Dispaying Demo, provide file as argument to  customize:")
+        # Test code
+    
+        c_code2 = """
+        void foo() {printf('foo');}
+        void bar() {printf('bar');}
+        int main() {
+            void (*fp)();
+            int input = 0;
+            if (input == 0)
+                fp = foo;
+            else
+                fp = bar;
+            fp();
+            return 0;
         }
-        fp();
-        return 0;
-    }
-    """
+        """
+        c_code = """
+        void hello() { printf("Hello\\n"); }
+        void goodbye() { printf("Goodbye\\n"); }
+        void nested() { printf("Nested\\n"); }
+        int main() {
+            void (*fp)();
+            void (*fp2)();
+            int i = 0;
+            fp = hello;
+            for(i = 0; i < 2; i++) {
+                while(i < 1) {
+                    fp();
+                    fp = goodbye;
+                }
+                do {
+                    fp2 = nested;
+                    fp2();
+                } while(i < 1);
+            }
+            fp();
+            return 0;
+        }
+        """
 
-    print("Output for c_code2:")
-    print(ReturnConverter().transform(cConverter().convert(c_code2)))
-    print("\nOutput for c_code:")
-    print(ReturnConverter().transform(cConverter().convert(c_code)))
-   
+        print("Output for c_code2:")
+        print(ReturnConverter().transform(cConverter().convert(c_code2)))
+        print("\nOutput for c_code:")
+        print(ReturnConverter().transform(cConverter().convert(c_code)))
+    
 

@@ -1,36 +1,46 @@
 from pycparser import c_parser, c_ast, c_generator
 import hashlib
 import re
+import sys
 
 class cConverter:
     def __init__(self):
-        self.function_ptr_vars = set()
+        self.function_ptr_vars = set()  # Function pointer variable names
+        self.assignments = {}  # Tracks last function assigned to each pointer
         self.generator = c_generator.CGenerator()
-        self.ast_cache = {}
+        self.ast_cache = {}  # Cache for parsed ASTs
 
     def analyze_ast(self, ast):
-        """Analyze AST to collect function pointer info"""
+        """Analyze AST to collect function pointer info and assignments"""
         for node in ast.ext:
             if isinstance(node, c_ast.FuncDef):
+                self.assignments.clear()  # Reset assignments for each function
                 self._collect_function_ptr_info(node.body)
 
     def _collect_function_ptr_info(self, compound_node):
-        """Collect function pointer declarations"""
+        """Collect function pointer declarations and assignments"""
         if not isinstance(compound_node, c_ast.Compound) or not compound_node.block_items:
             return
 
         for item in compound_node.block_items:
+            # Collect function pointer declarations
             if isinstance(item, c_ast.Decl) and isinstance(item.type, c_ast.PtrDecl):
                 if self._is_function_pointer(item.type):
                     self.function_ptr_vars.add(item.name)
-            elif isinstance(item, (c_ast.While, c_ast.DoWhile, c_ast.For)):
-                if isinstance(item.stmt, c_ast.Compound):
-                    self._collect_function_ptr_info(item.stmt)
+                    self.assignments[item.name] = None  # Initialize with no assignment
+
+            # Collect assignments
+            elif isinstance(item, c_ast.Assignment):
+                self._process_assignment(item)
+
+            # Handle control structures
             elif isinstance(item, c_ast.If):
-                if item.iftrue and isinstance(item.iftrue, c_ast.Compound):
+                if item.iftrue:
                     self._collect_function_ptr_info(item.iftrue)
-                if item.iffalse and isinstance(item.iffalse, c_ast.Compound):
+                if item.iffalse:
                     self._collect_function_ptr_info(item.iffalse)
+            elif isinstance(item, (c_ast.While, c_ast.DoWhile, c_ast.For)):
+                self._collect_function_ptr_info(item.stmt)
             elif isinstance(item, c_ast.Compound):
                 self._collect_function_ptr_info(item)
 
@@ -38,189 +48,281 @@ class cConverter:
         """Check if a type node is a function pointer"""
         return isinstance(type_node, c_ast.PtrDecl) and isinstance(type_node.type, c_ast.FuncDecl)
 
-    def _track_assignments_in_block(self, compound_node, assignments_state):
-        """Track assignments and transform calls with current state"""
+    def _process_assignment(self, assign_node):
+        """Process function pointer assignments"""
+        if (isinstance(assign_node.lvalue, c_ast.ID) and
+            assign_node.lvalue.name in self.function_ptr_vars and
+            isinstance(assign_node.rvalue, c_ast.ID)):
+            var_name = assign_node.lvalue.name
+            func_name = assign_node.rvalue.name
+            self.assignments[var_name] = func_name
+
+    def transform_ast(self, ast):
+        """Transform AST to remove function pointers and use direct calls"""
+        for node in ast.ext:
+            if isinstance(node, c_ast.FuncDef):
+                self.assignments.clear()  # Reset assignments for each function
+                self._transform_block(node.body)
+        return ast
+
+    def _transform_block(self, compound_node):
+        """Transform a compound statement, removing function pointers"""
         if not isinstance(compound_node, c_ast.Compound) or not compound_node.block_items:
-            return assignments_state
+            return
 
         new_items = []
-        current_assignments = assignments_state.copy()
-
         for item in compound_node.block_items:
+            # Skip function pointer declarations
             if isinstance(item, c_ast.Decl) and item.name in self.function_ptr_vars:
                 continue
 
+            # Process assignments to update tracking, but skip in output
             if isinstance(item, c_ast.Assignment) and isinstance(item.lvalue, c_ast.ID):
-                var_name = item.lvalue.name
-                if var_name in self.function_ptr_vars and isinstance(item.rvalue, c_ast.ID):
-                    current_assignments[var_name] = item.rvalue.name
+                if item.lvalue.name in self.function_ptr_vars:
+                    self._process_assignment(item)
                     continue
 
+            # Transform function pointer calls
             elif isinstance(item, c_ast.FuncCall) and isinstance(item.name, c_ast.ID):
                 var_name = item.name.name
-                if var_name in self.function_ptr_vars and var_name in current_assignments:
-                    new_items.append(c_ast.FuncCall(c_ast.ID(current_assignments[var_name]), item.args))
-                    continue
-
-            elif isinstance(item, c_ast.If):
-                iftrue_call = None
-                iffalse_call = None
-                if item.iftrue and isinstance(item.iftrue, c_ast.Assignment) and \
-                   isinstance(item.iftrue.lvalue, c_ast.ID) and \
-                   item.iftrue.lvalue.name in self.function_ptr_vars and \
-                   isinstance(item.iftrue.rvalue, c_ast.ID):
-                    iftrue_call = item.iftrue.rvalue.name
-                if item.iffalse and isinstance(item.iffalse, c_ast.Assignment) and \
-                   isinstance(item.iffalse.lvalue, c_ast.ID) and \
-                   item.iffalse.lvalue.name in self.function_ptr_vars and \
-                   isinstance(item.iffalse.rvalue, c_ast.ID):
-                    iffalse_call = item.iffalse.rvalue.name
-
-                if iftrue_call or iffalse_call:
-                    continue
+                if var_name in self.function_ptr_vars:
+                    func_name = self.assignments.get(var_name)
+                    if func_name:
+                        new_items.append(c_ast.FuncCall(
+                            c_ast.ID(func_name),
+                            item.args if item.args else c_ast.ExprList([])
+                        ))
+                    else:
+                        print(f"Warning: No assignment found for function pointer {var_name}")
                 else:
-                    if item.iftrue and isinstance(item.iftrue, c_ast.Compound):
-                        self._track_assignments_in_block(item.iftrue, current_assignments.copy())
-                    if item.iffalse and isinstance(item.iffalse, c_ast.Compound):
-                        self._track_assignments_in_block(item.iffalse, current_assignments.copy())
                     new_items.append(item)
 
+            # Handle control structures
+            elif isinstance(item, c_ast.If):
+                if item.iftrue:
+                    self._transform_block(item.iftrue)
+                if item.iffalse:
+                    self._transform_block(item.iffalse)
+                new_items.append(item)
             elif isinstance(item, (c_ast.While, c_ast.DoWhile, c_ast.For)):
-                if isinstance(item.stmt, c_ast.Compound):
-                    new_state = self._track_assignments_in_block(item.stmt, current_assignments.copy())
-                    current_assignments.update(new_state)
+                self._transform_block(item.stmt)
                 new_items.append(item)
-
             elif isinstance(item, c_ast.Compound):
-                self._track_assignments_in_block(item, current_assignments.copy())
+                self._transform_block(item)
                 new_items.append(item)
-
             else:
                 new_items.append(item)
 
         compound_node.block_items = new_items
-        return current_assignments
-
-    def transform_ast(self, ast):
-        """Transform AST to remove function pointers and use direct calls"""
-        initial_assignments = {}
-        for node in ast.ext:
-            if isinstance(node, c_ast.FuncDef):
-                if node.body.block_items:
-                    new_items = []
-                    i = 0
-                    while i < len(node.body.block_items):
-                        item = node.body.block_items[i]
-                        if isinstance(item, c_ast.Assignment) and isinstance(item.lvalue, c_ast.ID):
-                            var_name = item.lvalue.name
-                            if var_name in self.function_ptr_vars and isinstance(item.rvalue, c_ast.ID):
-                                initial_assignments[var_name] = item.rvalue.name
-                                i += 1
-                                continue
-                        elif (isinstance(item, c_ast.If) and i + 1 < len(node.body.block_items) and
-                              isinstance(node.body.block_items[i + 1], c_ast.FuncCall) and
-                              isinstance(node.body.block_items[i + 1].name, c_ast.ID) and
-                              node.body.block_items[i + 1].name.name in self.function_ptr_vars):
-                            iftrue_call = None
-                            iffalse_call = None
-                            if item.iftrue and isinstance(item.iftrue, c_ast.Assignment) and \
-                               isinstance(item.iftrue.lvalue, c_ast.ID) and \
-                               isinstance(item.iftrue.rvalue, c_ast.ID):
-                                iftrue_call = c_ast.FuncCall(item.iftrue.rvalue, None)
-                            if item.iffalse and isinstance(item.iffalse, c_ast.Assignment) and \
-                               isinstance(item.iffalse.lvalue, c_ast.ID) and \
-                               isinstance(item.iffalse.rvalue, c_ast.ID):
-                                iffalse_call = c_ast.FuncCall(item.iffalse.rvalue, None)
-                            if iftrue_call or iffalse_call:
-                                new_items.append(c_ast.If(item.cond, iftrue_call, iffalse_call))
-                                i += 2
-                                continue
-                        new_items.append(item)
-                        i += 1
-                    node.body.block_items = new_items
-                    self._track_assignments_in_block(node.body, initial_assignments)
-        return ast
 
     def _preprocess_c_code(self, c_code):
-        """Minimal preprocessing - just ensure proper formatting"""
-        # Preserve everything, just normalize whitespace
-        processed_code = '\n'.join(line.strip() for line in c_code.split('\n') if line.strip())
+        """Clean and preprocess C code"""
+        lines = [line for line in c_code.split('\n') if not line.strip().startswith('#')]
+        processed_code = '\n'.join(lines)
+        processed_code = re.sub(r"printf\('(.*?)'\)", r'printf("\1")', processed_code)
         return processed_code
+    
+    def _remove_comments(self, c_code):
+        working = True
+        ret_code = ""
+        while working:
+            if c_code.find("""'"'""") >= 0:
+                 start = c_code.find("""'"'""")
+                 end = start+3
+                 ret_code += c_code[:end]
+                 c_code = c_code[end:]
+            elif c_code.find("/*") >= 0 and (c_code.find('"') == -1 or c_code.find("/*") < c_code.find('"')):
+                start = c_code.find('/*')
+                end = len(c_code[:start+1]) + c_code[start+1:].find('*/') 
+                c_code = c_code[:start] + c_code[end+2:]
+            elif c_code.find("//") >= 0 and (c_code.find('"') == -1 or c_code.find("//") < c_code.find('"')):
+                start = c_code.find("//")
+                end = len(c_code[:start]) + c_code[start:].find("\n") 
+                c_code = c_code[:start] + c_code[end:]
+            elif (c_code.find('"') >= 0):
+                start = c_code.find('"')
+                end = len(c_code[:start+1]) + c_code[start+1:].find('"') 
+                ret_code += c_code[:end+1]
+                c_code = c_code[end+1:]
+            else:
+                working = False
+        return ret_code + c_code
 
     def convert(self, c_code):
         """Convert C code to remove function pointers and use direct calls"""
         try:
-            code_hash = hashlib.md5(c_code.encode()).hexdigest()
+            code_hash = hashlib.md5(c_code.encode()).digest()
+            c_code = self._remove_comments(c_code)
             if code_hash in self.ast_cache:
                 ast = self.ast_cache[code_hash]
             else:
                 clean_code = self._preprocess_c_code(c_code)
                 parser = c_parser.CParser()
-                # Add full preamble with stdio.h-like declarations
-                preamble = """
-                typedef unsigned long size_t;
-                typedef int FILE;
-                int printf(const char *format, ...);
-                """
                 try:
-                    ast = parser.parse(preamble + clean_code)
-                except Exception as e:
-                    return f"Error parsing code: {str(e)}"
+                    ast = parser.parse(clean_code)
+                except Exception:
+                    fake_code = f"void printf(const char *format, ...);\n{clean_code}"
+                    ast = parser.parse(fake_code)
                 self.ast_cache[code_hash] = ast
 
             self.function_ptr_vars.clear()
-            self.analyze_ast(ast)
-            transformed_ast = self.transform_ast(ast)
-            # Only output the user-defined functions, skip preamble
-            filtered_ast = c_ast.FileAST([node for node in transformed_ast.ext
-                                        if isinstance(node, c_ast.FuncDef)])
-            return self.generator.visit(filtered_ast)
+            self.analyze_ast(ast)  # First pass: collect declarations and initial assignments
+            transformed_ast = self.transform_ast(ast)  # Second pass: transform with updated assignments
+            return self.generator.visit(transformed_ast)
 
         except Exception as e:
             return f"Error converting code: {str(e)}"
 
-# Test code
-if __name__ == "__main__":
-    c_code2 = """
-    void foo() {printf('foo');}
-    void bar() {printf('bar');}
-    int main() {
-        void (*fp)();
-        int input = 0;
-        if (input == 0)
-            fp = foo;
-        else
-            fp = bar;
-        fp();
-        return 0;
-    }
-    """
-    c_code = """
-    void hello() { printf("Hello\\n"); }
-    void goodbye() { printf("Goodbye\\n"); }
-    void nested() { printf("Nested\\n"); }
-    int main() {
-        void (*fp)();
-        void (*fp2)();
-        int i = 0;
-        fp = hello;
-        for(i = 0; i < 2; i++) {
-            while(i < 1) {
-                fp();
-                fp = goodbye;
-            }
-            do {
-                fp2 = nested;
-                fp2();
-            } while(i < 1);
-        }
-        fp();
-        return 0;
-    }
-    """
 
-    converter = cConverter()
-    print("Output for c_code2:")
-    print(converter.convert(c_code2))
-    print("\nOutput for c_code:")
-    print(converter.convert(c_code))
+
+
+class ReturnConverter:
+    def __init__(self):
+        self.generator = c_generator.CGenerator()
+
+    def _generate_unique_name(self, func, base_name="out"):
+        existing_names = set()
+
+        # Collect names from parameters
+        if func.decl.type.args:
+            for param in func.decl.type.args.params:
+                if isinstance(param, c_ast.Decl):
+                    existing_names.add(param.name)
+
+        # Collect names from declarations inside the body
+        if func.body and func.body.block_items:
+            for stmt in func.body.block_items:
+                if isinstance(stmt, c_ast.Decl):
+                    existing_names.add(stmt.name)
+
+        # Generate unique name
+        suffix = 1
+        name = base_name
+        while name in existing_names:
+            name = f"{base_name}{suffix}"
+            suffix += 1
+        return name
+
+    def transform(self, code):
+        parser = c_parser.CParser()
+        ast = parser.parse(code)
+
+        for ext in ast.ext:
+            if isinstance(ext, c_ast.FuncDef):
+                func = ext
+
+                # Skip void functions
+                if func.decl.type.type.type.names == ['void']:
+                    continue
+
+                # Get return type
+                return_type = func.decl.type.type.type.names[0]
+
+                # Change return type to void
+                func.decl.type.type.type.names = ['void']
+
+                # Get a unique name for the output variable
+                out_name = self._generate_unique_name(func, "out")
+
+                # Add output parameter
+                out_param = c_ast.Decl(
+                    name=out_name,
+                    quals=[],
+                    align = None,
+                    storage=[],
+                    funcspec=[],
+                    type=c_ast.PtrDecl(
+                        quals=[],
+                        type=c_ast.TypeDecl(
+                            declname=out_name,
+                            quals=[],
+                            align=None,
+                            type=c_ast.IdentifierType(names=[return_type])
+                        )
+                    ),
+                    init=None,
+                    bitsize=None
+                )
+                if func.decl.type.args:
+                    func.decl.type.args.params.insert(0, out_param)
+                else:
+                    func.decl.type.args = c_ast.ParamList(params=[out_param])
+
+                # Replace return statements
+                if func.body and func.body.block_items:
+                    new_body = []
+                    for stmt in func.body.block_items:
+                        if isinstance(stmt, c_ast.Return) and stmt.expr:
+                            assign_stmt = c_ast.Assignment(
+                                op='=',
+                                lvalue=c_ast.UnaryOp(op='*', expr=c_ast.ID(out_name)),
+                                rvalue=stmt.expr
+                            )
+                            new_body.append(assign_stmt)
+                        elif not isinstance(stmt, c_ast.Return):
+                            new_body.append(stmt)
+                    func.body.block_items = new_body
+
+        return self.generator.visit(ast)
+
+
+
+if __name__ == '__main__':  
+
+    if(len(sys.argv) > 1):
+        try:
+            c_code = ""
+            with open(sys.argv[1], "r") as cfile:
+                c_code = '\n'.join(cfile.readlines())
+            print(ReturnConverter().transform(cConverter().convert(c_code)))
+        except Exception as e:
+            print(e)
+        
+    else:
+        print("Dispaying Demo, provide file as argument to  customize:")
+        # Test code
+    
+        c_code2 = """
+        void foo() {printf('foo');}
+        void bar() {printf('bar');}
+        int main() {
+            void (*fp)();
+            int input = 0;
+            if (input == 0)
+                fp = foo;
+            else
+                fp = bar;
+            fp();
+            return 0;
+        }
+        """
+        c_code = """
+        void hello() { printf("Hello\\n"); }
+        void goodbye() { printf("Goodbye\\n"); }
+        void nested() { printf("Nested\\n"); }
+        int main() {
+            void (*fp)();
+            void (*fp2)();
+            int i = 0;
+            fp = hello;
+            for(i = 0; i < 2; i++) {
+                while(i < 1) {
+                    fp();
+                    fp = goodbye;
+                }
+                do {
+                    fp2 = nested;
+                    fp2();
+                } while(i < 1);
+            }
+            fp();
+            return 0;
+        }
+        """
+
+        print("Output for c_code2:")
+        print(ReturnConverter().transform(cConverter().convert(c_code2)))
+        print("\nOutput for c_code:")
+        print(ReturnConverter().transform(cConverter().convert(c_code)))
+    
+
